@@ -65,6 +65,7 @@ import {
   markNotificationRead,
   queueProposalReview,
   removeDocumentFromWorkspace,
+  resetDemoWorkspaceState,
   resetThreadWorkspace,
   selectActiveAccount,
   selectActiveMarket,
@@ -119,6 +120,8 @@ interface UndoToast {
 
 const DEMO_ACCESS_HASH = 'dc5dc2c773728e6e3338f3bcff1bf6483ba9875044d4ee996f15b6e2af242fda'
 const DEMO_ACCESS_STORAGE_KEY = 'aura-demo-access'
+const DEFAULT_VOICE_TRANSCRIPT =
+  'Reduce risk without going fully defensive. Preserve liquidity for near-term distributions and keep the solution inside the household US-only mandate.'
 
 function getInitialAccessGranted() {
   try {
@@ -1576,9 +1579,9 @@ function IntakeReviewPanel({
   )
 }
 
-function AccessGate({ onUnlock }: { onUnlock: () => void }) {
+function AccessGate({ onUnlock }: { onUnlock: () => Promise<void> }) {
   const [password, setPassword] = useState('')
-  const [status, setStatus] = useState<'idle' | 'checking' | 'error'>('idle')
+  const [status, setStatus] = useState<'idle' | 'checking' | 'error' | 'reset-error'>('idle')
   const inputRef = useRef<HTMLInputElement | null>(null)
 
   useEffect(() => {
@@ -1597,16 +1600,17 @@ function AccessGate({ onUnlock }: { onUnlock: () => void }) {
       const submittedHash = await digestAccessSecret(password)
 
       if (submittedHash === DEMO_ACCESS_HASH) {
+        await onUnlock()
         try {
           sessionStorage.setItem(DEMO_ACCESS_STORAGE_KEY, DEMO_ACCESS_HASH)
         } catch {
           // Access still succeeds if session storage is blocked.
         }
-        onUnlock()
         return
       }
-    } catch {
-      // Fall through to the same generic error state.
+    } catch (error) {
+      setStatus(error instanceof Error && error.message === 'reset-failed' ? 'reset-error' : 'error')
+      return
     }
 
     setStatus('error')
@@ -1632,7 +1636,7 @@ function AccessGate({ onUnlock }: { onUnlock: () => void }) {
             autoComplete="current-password"
             onChange={(event) => {
               setPassword(event.target.value)
-              if (status === 'error') {
+              if (status === 'error' || status === 'reset-error') {
                 setStatus('idle')
               }
             }}
@@ -1646,9 +1650,11 @@ function AccessGate({ onUnlock }: { onUnlock: () => void }) {
         <div className="access-card__hint" id="access-gate-hint">
           The app stays blurred until access is granted.
         </div>
-        {status === 'error' ? (
+        {status === 'error' || status === 'reset-error' ? (
           <div className="access-card__error" id="access-gate-error" role="alert">
-            Password does not match. Please check the demo invite and try again.
+            {status === 'reset-error'
+              ? 'Access matched, but the demo could not reset. Please refresh and try again.'
+              : 'Password does not match. Please check the demo invite and try again.'}
           </div>
         ) : null}
 
@@ -1692,9 +1698,7 @@ export default function AuraDemoApp() {
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null)
   const [selectedFileName, setSelectedFileName] = useState('')
   const [undoToast, setUndoToast] = useState<UndoToast | null>(null)
-  const [voiceTranscript, setVoiceTranscript] = useState(
-    'Reduce risk without going fully defensive. Preserve liquidity for near-term distributions and keep the solution inside the household US-only mandate.',
-  )
+  const [voiceTranscript, setVoiceTranscript] = useState(DEFAULT_VOICE_TRANSCRIPT)
   const [workspaceError, setWorkspaceError] = useState('')
 
   const conversationBottomRef = useRef<HTMLDivElement | null>(null)
@@ -1866,6 +1870,37 @@ export default function AuraDemoApp() {
     } finally {
       pendingActionsRef.current = pendingActionsRef.current.filter((entry) => entry !== action)
       setPendingActions(pendingActionsRef.current)
+    }
+  }
+
+  async function handleAccessUnlock() {
+    try {
+      const resetWorkspace = await resetDemoWorkspaceState()
+      const resetThreadState = resetWorkspace.threadStateById[resetWorkspace.activeThreadId]
+      pendingActionsRef.current = []
+      workspaceRef.current = resetWorkspace
+
+      startTransition(() => {
+        setWorkspace(resetWorkspace)
+        setComposerValue('')
+        setDocumentKind('statement')
+        setInsightMode(null)
+        setIntakeMode(null)
+        setNotificationFilter('all')
+        setNotificationsOpen(false)
+        setPendingActions([])
+        setProposalOpen(resetThreadState.proposalStage !== 'draft')
+        setPortfolioRailOpen(false)
+        setMarketRailOpen(false)
+        setActiveDocumentId(null)
+        setSelectedFileName('')
+        setUndoToast(null)
+        setVoiceTranscript(DEFAULT_VOICE_TRANSCRIPT)
+        setWorkspaceError('')
+        setAccessGranted(true)
+      })
+    } catch {
+      throw new Error('reset-failed')
     }
   }
 
@@ -2642,7 +2677,7 @@ export default function AuraDemoApp() {
         />
         </aside>
       </div>
-      {!accessGranted ? <AccessGate onUnlock={() => setAccessGranted(true)} /> : null}
+      {!accessGranted ? <AccessGate onUnlock={handleAccessUnlock} /> : null}
     </div>
   )
 }

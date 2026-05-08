@@ -99,6 +99,10 @@ export function getInitialWorkspaceState(): AuraWorkspaceState {
   return readWorkspaceState()
 }
 
+export async function resetDemoWorkspaceState(): Promise<AuraWorkspaceState> {
+  return persistWorkspaceState(createDefaultWorkspaceState())
+}
+
 export async function selectActiveThread(
   workspace: AuraWorkspaceState,
   threadId: string,
