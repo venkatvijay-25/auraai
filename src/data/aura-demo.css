@@ -71,6 +71,97 @@ textarea:focus-visible {
   color: var(--aura-text);
 }
 
+.aura-app.is-access-locked {
+  height: 100vh;
+  overflow: hidden;
+}
+
+.aura-app__content {
+  min-height: 100vh;
+  transition:
+    filter 240ms ease,
+    transform 240ms ease;
+}
+
+.aura-app.is-access-locked .aura-app__content {
+  filter: blur(18px) saturate(0.72);
+  pointer-events: none;
+  transform: scale(1.012);
+  user-select: none;
+}
+
+.access-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: grid;
+  place-items: center;
+  padding: 1.5rem;
+  background:
+    radial-gradient(circle at 50% 28%, rgba(67, 224, 207, 0.16), transparent 28%),
+    rgba(0, 10, 20, 0.42);
+  backdrop-filter: blur(8px);
+}
+
+.access-card {
+  display: grid;
+  gap: 1rem;
+  width: min(100%, 28rem);
+  padding: 1.35rem;
+  border-radius: 1.6rem;
+  border: 1px solid rgba(67, 224, 207, 0.22);
+  background: linear-gradient(180deg, rgba(4, 32, 59, 0.98), rgba(0, 15, 33, 0.98));
+  box-shadow: var(--aura-shadow-strong);
+}
+
+.access-card__mark {
+  display: grid;
+  place-items: center;
+  width: 3.25rem;
+  height: 3.25rem;
+  border-radius: 1.1rem;
+  background: rgba(67, 224, 207, 0.14);
+  color: var(--aura-primary);
+}
+
+.access-card__copy {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.access-card__copy h2 {
+  margin: 0;
+  color: #ffffff;
+  font-size: clamp(1.65rem, 4vw, 2.2rem);
+  letter-spacing: -0.05em;
+}
+
+.access-card__copy p,
+.access-card__hint,
+.access-card__error {
+  margin: 0;
+  color: var(--aura-text-soft);
+  font-size: 0.88rem;
+  line-height: 1.55;
+}
+
+.access-card__field {
+  margin-top: 0.2rem;
+}
+
+.access-card__error {
+  padding: 0.75rem 0.85rem;
+  border-radius: 0.9rem;
+  border: 1px solid rgba(255, 180, 171, 0.22);
+  background: rgba(255, 180, 171, 0.08);
+  color: #ffe1dc;
+}
+
+.access-card .primary-button {
+  flex: none;
+  width: 100%;
+}
+
 .mobile-overlay {
   position: fixed;
   inset: 0;

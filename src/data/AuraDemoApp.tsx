@@ -117,6 +117,26 @@ interface UndoToast {
   onUndo: () => void
 }
 
+const DEMO_ACCESS_HASH = 'dc5dc2c773728e6e3338f3bcff1bf6483ba9875044d4ee996f15b6e2af242fda'
+const DEMO_ACCESS_STORAGE_KEY = 'aura-demo-access'
+
+function getInitialAccessGranted() {
+  try {
+    return sessionStorage.getItem(DEMO_ACCESS_STORAGE_KEY) === DEMO_ACCESS_HASH
+  } catch {
+    return false
+  }
+}
+
+async function digestAccessSecret(secret: string) {
+  const encodedSecret = new TextEncoder().encode(secret)
+  const digest = await crypto.subtle.digest('SHA-256', encodedSecret)
+
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('')
+}
+
 function getInitialProposalOpen() {
   const workspace = getInitialWorkspaceState()
   return workspace.threadStateById[workspace.activeThreadId].proposalStage !== 'draft'
@@ -1556,6 +1576,90 @@ function IntakeReviewPanel({
   )
 }
 
+function AccessGate({ onUnlock }: { onUnlock: () => void }) {
+  const [password, setPassword] = useState('')
+  const [status, setStatus] = useState<'idle' | 'checking' | 'error'>('idle')
+  const inputRef = useRef<HTMLInputElement | null>(null)
+
+  useEffect(() => {
+    inputRef.current?.focus()
+  }, [])
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+
+    if (!password.trim() || status === 'checking') {
+      return
+    }
+
+    setStatus('checking')
+    try {
+      const submittedHash = await digestAccessSecret(password)
+
+      if (submittedHash === DEMO_ACCESS_HASH) {
+        try {
+          sessionStorage.setItem(DEMO_ACCESS_STORAGE_KEY, DEMO_ACCESS_HASH)
+        } catch {
+          // Access still succeeds if session storage is blocked.
+        }
+        onUnlock()
+        return
+      }
+    } catch {
+      // Fall through to the same generic error state.
+    }
+
+    setStatus('error')
+  }
+
+  return (
+    <div className="access-gate" role="dialog" aria-modal="true" aria-labelledby="access-gate-title">
+      <form className="access-card" onSubmit={handleSubmit}>
+        <div className="access-card__mark" aria-hidden="true">
+          <ShieldAlert size={22} />
+        </div>
+        <div className="access-card__copy">
+          <div className="section-kicker">Demo access</div>
+          <h2 id="access-gate-title">Enter the Aura demo password</h2>
+          <p>Use the shared demo password to unlock this advisor workspace for the current browser session.</p>
+        </div>
+
+        <label className="field-control access-card__field">
+          <span>Password</span>
+          <input
+            aria-describedby={status === 'error' ? 'access-gate-error' : 'access-gate-hint'}
+            aria-invalid={status === 'error'}
+            autoComplete="current-password"
+            onChange={(event) => {
+              setPassword(event.target.value)
+              if (status === 'error') {
+                setStatus('idle')
+              }
+            }}
+            placeholder="Enter demo password"
+            ref={inputRef}
+            type="password"
+            value={password}
+          />
+        </label>
+
+        <div className="access-card__hint" id="access-gate-hint">
+          The app stays blurred until access is granted.
+        </div>
+        {status === 'error' ? (
+          <div className="access-card__error" id="access-gate-error" role="alert">
+            Password does not match. Please check the demo invite and try again.
+          </div>
+        ) : null}
+
+        <button className="primary-button" disabled={status === 'checking'} type="submit">
+          {status === 'checking' ? 'Checking...' : 'Unlock demo'}
+        </button>
+      </form>
+    </div>
+  )
+}
+
 function UndoBanner({ toast }: { toast: UndoToast | null }) {
   if (!toast) {
     return null
@@ -1573,6 +1677,7 @@ function UndoBanner({ toast }: { toast: UndoToast | null }) {
 }
 
 export default function AuraDemoApp() {
+  const [accessGranted, setAccessGranted] = useState(() => getInitialAccessGranted())
   const [workspace, setWorkspace] = useState<AuraWorkspaceState>(() => getInitialWorkspaceState())
   const [composerValue, setComposerValue] = useState('')
   const [documentKind, setDocumentKind] = useState<DocumentArtifact['kind']>('statement')
@@ -1628,6 +1733,7 @@ export default function AuraDemoApp() {
     accountsById[threadWorkspace.activeAccountId] ?? accountsById[threadFeature.defaultAccountId] ?? threadFeature.accounts[0]
   const activeScenario = useMemo(() => scenarioById[activeScenarioId], [activeScenarioId])
   const activeMarket = useMemo(() => marketById[activeMarketId], [activeMarketId])
+  const appContentRef = useRef<HTMLDivElement | null>(null)
   const resolvedActiveDocumentId =
     activeDocumentId && activeDocuments.some((document) => document.id === activeDocumentId)
       ? activeDocumentId
@@ -1682,6 +1788,20 @@ export default function AuraDemoApp() {
   useEffect(() => {
     workspaceRef.current = workspace
   }, [workspace])
+
+  useEffect(() => {
+    const appContent = appContentRef.current
+
+    if (!appContent) {
+      return
+    }
+
+    if (accessGranted) {
+      appContent.removeAttribute('inert')
+    } else {
+      appContent.setAttribute('inert', '')
+    }
+  }, [accessGranted])
 
   useEffect(() => {
     function handleKeyDown(event: globalThis.KeyboardEvent) {
@@ -2094,30 +2214,31 @@ export default function AuraDemoApp() {
   }
 
   return (
-    <div className="aura-app">
-      <div
-        aria-hidden="true"
-        className={clsx('mobile-overlay', (portfolioRailOpen || marketRailOpen) && 'is-visible')}
-        onClick={() => {
-          const shouldFocusMarket = marketRailOpen
-          setPortfolioRailOpen(false)
-          setMarketRailOpen(false)
-          if (shouldFocusMarket) {
-            marketButtonRef.current?.focus()
-          } else {
-            portfolioButtonRef.current?.focus()
-          }
-        }}
-      />
+    <div className={clsx('aura-app', !accessGranted && 'is-access-locked')}>
+      <div className="aura-app__content" ref={appContentRef} aria-hidden={accessGranted ? undefined : true}>
+        <div
+          aria-hidden="true"
+          className={clsx('mobile-overlay', (portfolioRailOpen || marketRailOpen) && 'is-visible')}
+          onClick={() => {
+            const shouldFocusMarket = marketRailOpen
+            setPortfolioRailOpen(false)
+            setMarketRailOpen(false)
+            if (shouldFocusMarket) {
+              marketButtonRef.current?.focus()
+            } else {
+              portfolioButtonRef.current?.focus()
+            }
+          }}
+        />
 
-      <aside
-        aria-label="Portfolio workspace"
-        aria-modal={portfolioRailOpen ? 'true' : undefined}
-        className={clsx('aura-rail aura-rail--left', portfolioRailOpen && 'is-open')}
-        id="portfolio-rail"
-        ref={portfolioRailRef}
-        role={portfolioRailOpen ? 'dialog' : 'complementary'}
-      >
+        <aside
+          aria-label="Portfolio workspace"
+          aria-modal={portfolioRailOpen ? 'true' : undefined}
+          className={clsx('aura-rail aura-rail--left', portfolioRailOpen && 'is-open')}
+          id="portfolio-rail"
+          ref={portfolioRailRef}
+          role={portfolioRailOpen ? 'dialog' : 'complementary'}
+        >
         <div className="mobile-rail-topbar">
           <span>Portfolio</span>
           <button
@@ -2142,9 +2263,9 @@ export default function AuraDemoApp() {
           }}
           onSelectThread={handleSelectThread}
         />
-      </aside>
+        </aside>
 
-      <main className="aura-main">
+        <main className="aura-main">
         <header className="top-shell">
           <div className="mobile-rail-actions">
             <button
@@ -2488,16 +2609,16 @@ export default function AuraDemoApp() {
             Source-backed demo for US markets only. Review tax and suitability assumptions before trading.
           </div>
         </form>
-      </main>
+        </main>
 
-      <aside
-        aria-label="Market workspace"
-        aria-modal={marketRailOpen ? 'true' : undefined}
-        className={clsx('aura-rail aura-rail--right', marketRailOpen && 'is-open')}
-        id="market-rail"
-        ref={marketRailRef}
-        role={marketRailOpen ? 'dialog' : 'complementary'}
-      >
+        <aside
+          aria-label="Market workspace"
+          aria-modal={marketRailOpen ? 'true' : undefined}
+          className={clsx('aura-rail aura-rail--right', marketRailOpen && 'is-open')}
+          id="market-rail"
+          ref={marketRailRef}
+          role={marketRailOpen ? 'dialog' : 'complementary'}
+        >
         <div className="mobile-rail-topbar">
           <span>Markets</span>
           <button
@@ -2519,7 +2640,9 @@ export default function AuraDemoApp() {
             setMarketRailOpen(false)
           }}
         />
-      </aside>
+        </aside>
+      </div>
+      {!accessGranted ? <AccessGate onUnlock={() => setAccessGranted(true)} /> : null}
     </div>
   )
 }
