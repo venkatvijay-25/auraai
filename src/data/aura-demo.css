@@ -572,7 +572,36 @@ textarea:focus-visible {
 
 .analysis-timeline__rail {
   overflow-x: auto;
-  padding-bottom: 0.2rem;
+  overflow-y: hidden;
+  padding-bottom: 0.45rem;
+  scrollbar-color: rgba(67, 224, 207, 0.62) rgba(0, 15, 33, 0.52);
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+}
+
+.analysis-timeline__rail::-webkit-scrollbar {
+  height: 0.55rem;
+}
+
+.analysis-timeline__rail::-webkit-scrollbar-track {
+  border-radius: 999px;
+  background: rgba(0, 15, 33, 0.62);
+  box-shadow: inset 0 0 0 1px rgba(176, 200, 235, 0.1);
+}
+
+.analysis-timeline__rail::-webkit-scrollbar-thumb {
+  border: 2px solid rgba(0, 15, 33, 0.62);
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(67, 224, 207, 0.82), rgba(176, 200, 235, 0.7));
+}
+
+.analysis-timeline__rail::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(90deg, var(--aura-primary), var(--aura-secondary));
+}
+
+.analysis-timeline__rail::-webkit-scrollbar-button,
+.analysis-timeline__rail::-webkit-scrollbar-corner {
+  display: none;
 }
 
 .analysis-timeline__item {
