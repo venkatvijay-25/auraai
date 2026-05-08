@@ -14,9 +14,14 @@ import {
   ArrowDownRight,
   ArrowUpRight,
   Bell,
+  CheckCircle2,
+  FileText,
   LayoutGrid,
+  ListChecks,
   Mic,
   Paperclip,
+  RotateCcw,
+  Search,
   SendHorizontal,
   ShieldAlert,
   Sparkles,
@@ -52,16 +57,19 @@ import {
   archiveNotification,
   addProposalComment,
   ensureProposalReady,
+  focusThreadAnalysis,
   exportProposalMemo,
   focusThreadScenario,
   getInitialWorkspaceState,
   markDocumentRead,
   markNotificationRead,
   queueProposalReview,
+  removeDocumentFromWorkspace,
   resetThreadWorkspace,
   selectActiveAccount,
   selectActiveMarket,
   selectActiveThread,
+  setProposalWorkflowStage,
   submitPromptToWorkspace,
   toggleComparedAnalysis,
   toggleAdvisorQueue,
@@ -70,6 +78,7 @@ import {
   updateProposalTrade,
   generateThreadSummary,
   type AuraWorkspaceState,
+  type ConversationMessage,
   type DocumentArtifact,
   type NotificationItem,
   type NotificationTone,
@@ -80,6 +89,33 @@ import {
 
 type InsightMode = 'detail' | 'action' | null
 type NotificationFilter = 'all' | 'unread' | 'workflow' | 'documents'
+type AsyncAction =
+  | 'advisor'
+  | 'attachment'
+  | 'export'
+  | 'notification'
+  | 'prompt'
+  | 'queue'
+  | 'reset'
+  | 'summary'
+  | 'thread'
+  | 'voice'
+type IntakeMode = 'upload' | 'voice' | null
+
+interface AnalysisReference {
+  id: string
+  label: string
+  scenarioId: ScenarioId
+  createdAt: string
+  metricValue: string
+  metricDelta: string
+}
+
+interface UndoToast {
+  label: string
+  actionLabel: string
+  onUndo: () => void
+}
 
 function getInitialProposalOpen() {
   const workspace = getInitialWorkspaceState()
@@ -151,6 +187,103 @@ function proposalStageLabel(stage: ProposalStage) {
   if (stage === 'exported') return 'Memo exported'
   if (stage === 'ready') return 'Ready to route'
   return 'Draft proposal'
+}
+
+function buildAnalysisReference(message: ConversationMessage): AnalysisReference | null {
+  if (message.variant !== 'analysis' || !message.scenarioId) {
+    return null
+  }
+
+  const scenario = scenarioById[message.scenarioId]
+
+  return {
+    id: message.id,
+    label: scenario.label,
+    scenarioId: scenario.id,
+    createdAt: message.createdAt,
+    metricValue: scenario.metricValue,
+    metricDelta: scenario.metricDelta,
+  }
+}
+
+function scenarioItemMatchesAccount(item: Scenario['items'][number], account: AccountProfile) {
+  const normalizedName = account.name.toLowerCase()
+  const accountTickers = new Set(account.holdings.map((holding) => holding.ticker.toLowerCase()))
+  const accountHoldingNames = account.holdings.map((holding) => holding.name.toLowerCase())
+
+  return (
+    item.meta.toLowerCase().includes(normalizedName) ||
+    accountTickers.has(item.ticker.toLowerCase()) ||
+    accountHoldingNames.some((holdingName) => item.name.toLowerCase().includes(holdingName))
+  )
+}
+
+function getScopedScenarioItems(scenario: Scenario, account: AccountProfile) {
+  return scenario.items.filter((item) => scenarioItemMatchesAccount(item, account))
+}
+
+function getProposalReadiness(proposalDraft: ProposalDraftState, activeAccount: AccountProfile) {
+  const scopedTrades = proposalDraft.trades.filter((trade) => trade.accountId === activeAccount.id)
+  const includedScopedTrades = scopedTrades.filter((trade) => trade.included)
+  const checklistComplete = proposalDraft.checklist.every((item) => item.complete)
+  const hasReviewerComment = proposalDraft.comments.length > 0
+  const reviewReadyTrades = includedScopedTrades.filter((trade) => trade.status !== 'draft')
+  const approvedTrades = includedScopedTrades.filter((trade) => trade.status === 'approved')
+  const hasIncludedTrade = includedScopedTrades.length > 0
+  const canExport = scopedTrades.length > 0 && hasIncludedTrade && checklistComplete && hasReviewerComment
+  const canQueue = canExport && approvedTrades.length === includedScopedTrades.length
+
+  return {
+    approvedTrades,
+    canExport,
+    canQueue,
+    checklistComplete,
+    exportReason: !scopedTrades.length
+      ? 'No trades are mapped to the selected account.'
+      : !hasIncludedTrade
+        ? 'Include at least one selected-account trade.'
+        : !checklistComplete
+          ? 'Complete all workflow checks first.'
+          : !hasReviewerComment
+            ? 'Add a reviewer comment before exporting.'
+            : 'Ready to export.',
+    hasReviewerComment,
+    includedScopedTrades,
+    queueReason: !canExport
+      ? 'Export readiness is incomplete.'
+      : approvedTrades.length !== includedScopedTrades.length
+        ? 'Approve every included selected-account trade before queueing.'
+        : 'Ready for advisor queue.',
+    reviewReadyTrades,
+    scopedTrades,
+  }
+}
+
+function trapFocusInContainer(event: globalThis.KeyboardEvent, container: HTMLElement | null) {
+  if (event.key !== 'Tab' || !container) {
+    return
+  }
+
+  const focusable = Array.from(
+    container.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), [href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    ),
+  ).filter((element) => !element.hasAttribute('aria-hidden'))
+
+  if (!focusable.length) {
+    return
+  }
+
+  const first = focusable[0]
+  const last = focusable[focusable.length - 1]
+
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault()
+    last.focus()
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault()
+    first.focus()
+  }
 }
 
 function AssistantAvatar() {
@@ -511,14 +644,20 @@ function AccountLens({
 }
 
 function WorkspaceSummary({
-  compareLabels,
+  comparedAnalyses,
   onGenerateSummary,
-  pinnedLabels,
+  onJumpToAnalysis,
+  onToggleCompare,
+  onTogglePin,
+  pinnedAnalyses,
   summary,
 }: {
-  compareLabels: string[]
+  comparedAnalyses: AnalysisReference[]
   onGenerateSummary: () => void
-  pinnedLabels: string[]
+  onJumpToAnalysis: (analysisId: string, scenarioId: ScenarioId) => void
+  onToggleCompare: (analysisId: string) => void
+  onTogglePin: (analysisId: string) => void
+  pinnedAnalyses: AnalysisReference[]
   summary: string
 }) {
   return (
@@ -536,12 +675,22 @@ function WorkspaceSummary({
       <div className="summary-shell__grid">
         <div className="context-showcase__card">
           <div className="section-kicker">Pinned analyses</div>
-          <div className="follow-up-row">
-            {pinnedLabels.length ? (
-              pinnedLabels.map((label) => (
-                <span className="trust-chip" key={label}>
-                  {label}
-                </span>
+          <div className="analysis-reference-stack">
+            {pinnedAnalyses.length ? (
+              pinnedAnalyses.map((analysis) => (
+                <div className="analysis-reference" key={analysis.id}>
+                  <button
+                    className="analysis-reference__main"
+                    onClick={() => onJumpToAnalysis(analysis.id, analysis.scenarioId)}
+                    type="button"
+                  >
+                    <span>{analysis.label}</span>
+                    <span>{analysis.metricValue}</span>
+                  </button>
+                  <button className="mini-toggle" onClick={() => onTogglePin(analysis.id)} type="button">
+                    Unpin
+                  </button>
+                </div>
               ))
             ) : (
               <span className="goal-row__meta">Pin any analysis card to keep it in the advisor stack.</span>
@@ -550,20 +699,127 @@ function WorkspaceSummary({
         </div>
         <div className="context-showcase__card">
           <div className="section-kicker">Compare mode</div>
-          <div className="follow-up-row">
-            {compareLabels.length ? (
-              compareLabels.map((label) => (
-                <span className="trust-chip" key={label}>
-                  {label}
-                </span>
+          <div className="analysis-reference-stack">
+            {comparedAnalyses.length ? (
+              comparedAnalyses.map((analysis) => (
+                <div className="analysis-reference" key={analysis.id}>
+                  <button
+                    className="analysis-reference__main"
+                    onClick={() => onJumpToAnalysis(analysis.id, analysis.scenarioId)}
+                    type="button"
+                  >
+                    <span>{analysis.label}</span>
+                    <span>{analysis.metricDelta}</span>
+                  </button>
+                  <button className="mini-toggle" onClick={() => onToggleCompare(analysis.id)} type="button">
+                    Remove
+                  </button>
+                </div>
               ))
             ) : (
               <span className="goal-row__meta">Select up to two analyses to compare tradeoffs side-by-side.</span>
             )}
           </div>
+          {comparedAnalyses.length >= 2 ? (
+            <div className="comparison-table">
+              <div className="comparison-row">
+                <span>Metric</span>
+                <strong>{comparedAnalyses[0].label}</strong>
+                <strong>{comparedAnalyses[1].label}</strong>
+              </div>
+              <div className="comparison-row">
+                <span>Value</span>
+                <span>{comparedAnalyses[0].metricValue}</span>
+                <span>{comparedAnalyses[1].metricValue}</span>
+              </div>
+              <div className="comparison-row">
+                <span>Delta</span>
+                <span>{comparedAnalyses[0].metricDelta}</span>
+                <span>{comparedAnalyses[1].metricDelta}</span>
+              </div>
+            </div>
+          ) : comparedAnalyses.length === 1 ? (
+            <div className="compliance-note">Add one more analysis to unlock the side-by-side tradeoff view.</div>
+          ) : null}
         </div>
       </div>
     </section>
+  )
+}
+
+function AnalysisTimeline({
+  activeAnalysisId,
+  analyses,
+  onJumpToAnalysis,
+}: {
+  activeAnalysisId: string | null
+  analyses: AnalysisReference[]
+  onJumpToAnalysis: (analysisId: string, scenarioId: ScenarioId) => void
+}) {
+  if (!analyses.length) {
+    return null
+  }
+
+  return (
+    <section className="analysis-timeline" aria-label="Analysis history">
+      <div className="analysis-timeline__header">
+        <Search size={14} />
+        <div className="section-kicker">Analysis history</div>
+      </div>
+      <div className="analysis-timeline__rail">
+        {analyses.map((analysis) => (
+          <button
+            className={clsx('analysis-timeline__item', analysis.id === activeAnalysisId && 'is-active')}
+            key={analysis.id}
+            onClick={() => onJumpToAnalysis(analysis.id, analysis.scenarioId)}
+            type="button"
+          >
+            <span>{analysis.label}</span>
+            <span>{analysis.createdAt}</span>
+          </button>
+        ))}
+      </div>
+    </section>
+  )
+}
+
+function AnalysisPreview({
+  compared,
+  message,
+  onExpand,
+  onToggleCompare,
+  onTogglePin,
+  pinned,
+  scenario,
+}: {
+  compared: boolean
+  message: ConversationMessage
+  onExpand: () => void
+  onToggleCompare: () => void
+  onTogglePin: () => void
+  pinned: boolean
+  scenario: Scenario
+}) {
+  return (
+    <article className="analysis-preview">
+      <div>
+        <div className="message-meta">{message.createdAt}</div>
+        <h3>{scenario.label}</h3>
+        <p>{scenario.responseText}</p>
+      </div>
+      <div className="analysis-preview__actions">
+        <span className="trust-chip">{scenario.metricValue}</span>
+        <button className="secondary-button" onClick={onExpand} type="button">
+          Expand
+        </button>
+        <button className={clsx('mini-toggle', pinned && 'is-active')} onClick={onTogglePin} type="button">
+          {pinned ? 'Pinned' : 'Pin'}
+        </button>
+        <button className={clsx('mini-toggle', compared && 'is-active')} onClick={onToggleCompare} type="button">
+          {compared ? 'Compared' : 'Compare'}
+        </button>
+      </div>
+    </article>
   )
 }
 
@@ -647,6 +903,7 @@ function ScenarioResponse({
   activeAccount,
   activeMarket,
   enhancement,
+  exportBusy,
   insightMode,
   onExportProposal,
   onFollowUp,
@@ -663,12 +920,14 @@ function ScenarioResponse({
   proposalDraft,
   proposalOpen,
   proposalStage,
+  queueBusy,
   scenario,
 }: {
   active: boolean
   activeAccount: AccountProfile
   activeMarket: MarketCard
   enhancement: ScenarioEnhancement
+  exportBusy: boolean
   insightMode: InsightMode
   onExportProposal: () => void
   onFollowUp: (followUp: FollowUpPrompt) => void
@@ -688,6 +947,7 @@ function ScenarioResponse({
   proposalDraft: ProposalDraftState
   proposalOpen: boolean
   proposalStage: ProposalStage
+  queueBusy: boolean
   scenario: Scenario
 }) {
   const chartStroke = scenario.id === 'risk' ? '#ffb4ab' : '#43e0cf'
@@ -695,6 +955,7 @@ function ScenarioResponse({
   const proposal = scenario.proposal
   const marketImpact = enhancement.marketImpactById[activeMarket.id]
   const comparisonSeries = buildComparisonSeries(scenario, enhancement, activeMarket)
+  const scopedItems = getScopedScenarioItems(scenario, activeAccount)
 
   return (
     <div className="rich-response">
@@ -868,29 +1129,37 @@ function ScenarioResponse({
         </div>
 
         <div className="holdings-card">
-          <div className="section-kicker">
-            {scenario.listTitle} | selected account {activeAccount.name}
-          </div>
+          <div className="section-kicker">{scenario.listTitle} | Account lens: {activeAccount.name}</div>
 
           <div className="holding-stack">
-            {scenario.items.map((item) => (
-              <div className="holding-row" key={`${scenario.id}-${item.ticker}`}>
-                <div className="holding-row__identity">
-                  <div className={clsx('holding-badge', toneClass(item.tone))}>{item.ticker}</div>
-                  <div>
-                    <div className="holding-row__name">{item.name}</div>
-                    <div className="holding-row__meta">{item.meta}</div>
+            {scopedItems.length ? (
+              scopedItems.map((item) => (
+                <div className="holding-row" key={`${scenario.id}-${item.ticker}`}>
+                  <div className="holding-row__identity">
+                    <div className={clsx('holding-badge', toneClass(item.tone))}>{item.ticker}</div>
+                    <div>
+                      <div className="holding-row__name">{item.name}</div>
+                      <div className="holding-row__meta">{item.meta}</div>
+                    </div>
                   </div>
-                </div>
 
-                <div className="holding-row__metrics">
-                  <div className="holding-row__value">{item.value}</div>
-                  <div className={clsx('holding-row__change', toneClass(item.tone))}>
-                    {item.change}
+                  <div className="holding-row__metrics">
+                    <div className="holding-row__value">{item.value}</div>
+                    <div className={clsx('holding-row__change', toneClass(item.tone))}>
+                      {item.change}
+                    </div>
                   </div>
                 </div>
+              ))
+            ) : (
+              <div className="empty-state">
+                <div className="section-kicker">Household-only signal</div>
+                <p>
+                  This scenario has no direct holding match inside {activeAccount.name}. Switch accounts or keep this
+                  insight at household scope.
+                </p>
               </div>
-            ))}
+            )}
           </div>
 
           <div className="holding-actions">
@@ -939,6 +1208,8 @@ function ScenarioResponse({
             proposal={proposal}
             proposalDraft={proposalDraft}
             proposalStage={proposalStage}
+            exportBusy={exportBusy}
+            queueBusy={queueBusy}
           />
         ) : null}
       </article>
@@ -948,6 +1219,7 @@ function ScenarioResponse({
 
 function ProposalPanel({
   activeAccount,
+  exportBusy,
   onAddProposalComment,
   onExportProposal,
   onQueueProposal,
@@ -956,8 +1228,10 @@ function ProposalPanel({
   proposal,
   proposalDraft,
   proposalStage,
+  queueBusy,
 }: {
   activeAccount: AccountProfile
+  exportBusy: boolean
   onAddProposalComment: (comment: string) => void
   onExportProposal: () => void
   onQueueProposal: () => void
@@ -969,9 +1243,11 @@ function ProposalPanel({
   proposal: ProposalWorkflow
   proposalDraft: ProposalDraftState
   proposalStage: ProposalStage
+  queueBusy: boolean
 }) {
   const [commentDraft, setCommentDraft] = useState('')
-  const filteredTrades = proposalDraft.trades.filter((trade) => trade.accountId === activeAccount.id)
+  const readiness = getProposalReadiness(proposalDraft, activeAccount)
+  const scopedProposalAccounts = proposal.accounts.filter((account) => account.name === activeAccount.name)
 
   return (
     <section className="proposal-panel">
@@ -985,80 +1261,110 @@ function ProposalPanel({
 
       <p className="proposal-panel__summary">{proposal.summary}</p>
 
+      <div className="readiness-panel">
+        <div className="readiness-panel__metric">
+          <CheckCircle2 size={16} />
+          <span>{readiness.checklistComplete ? 'Checks complete' : 'Checks pending'}</span>
+        </div>
+        <div className="readiness-panel__metric">
+          <ListChecks size={16} />
+          <span>
+            {readiness.reviewReadyTrades.length}/{readiness.includedScopedTrades.length || readiness.scopedTrades.length}{' '}
+            selected-account trades reviewed
+          </span>
+        </div>
+        <div className="readiness-panel__metric">
+          <FileText size={16} />
+          <span>{readiness.hasReviewerComment ? 'Reviewer note captured' : 'Reviewer note needed'}</span>
+        </div>
+      </div>
+
       <div className="proposal-grid">
         <div className="proposal-block">
-          <div className="section-kicker">Impacted accounts</div>
+          <div className="section-kicker">Impacted accounts | Account lens</div>
           <div className="proposal-list">
-            {proposal.accounts.map((account) => (
-              <div className="proposal-item" key={account.name}>
-                <div className="proposal-item__title">{account.name}</div>
-                <div className="proposal-item__meta">{account.mandate}</div>
-                <p>{account.impact}</p>
+            {scopedProposalAccounts.length ? (
+              scopedProposalAccounts.map((account) => (
+                <div className="proposal-item" key={account.name}>
+                  <div className="proposal-item__title">{account.name}</div>
+                  <div className="proposal-item__meta">{account.mandate}</div>
+                  <p>{account.impact}</p>
+                </div>
+              ))
+            ) : (
+              <div className="empty-state">
+                <p>No direct proposal account is mapped to {activeAccount.name}. Switch account lens to review this basket.</p>
               </div>
-            ))}
+            )}
           </div>
         </div>
 
         <div className="proposal-block">
           <div className="section-kicker">Trade basket | {activeAccount.name}</div>
           <div className="proposal-list">
-            {(filteredTrades.length ? filteredTrades : proposalDraft.trades).map((trade) => (
-              <div className="proposal-item" key={trade.id}>
-                <div className="proposal-item__split">
-                  <div className="proposal-item__title">
-                    {trade.action} {trade.ticker}
+            {readiness.scopedTrades.length ? (
+              readiness.scopedTrades.map((trade) => (
+                <div className="proposal-item" key={trade.id}>
+                  <div className="proposal-item__split">
+                    <div className="proposal-item__title">
+                      {trade.action} {trade.ticker}
+                    </div>
+                    <span className="proposal-item__shift">{trade.shift}</span>
                   </div>
-                  <span className="proposal-item__shift">{trade.shift}</span>
+                  <div className="proposal-item__meta">
+                    {trade.name} | {trade.notional}
+                  </div>
+                  <p>{trade.note}</p>
+                  <div className="proposal-trade-controls">
+                    <button
+                      className={clsx('mini-toggle', trade.included && 'is-active')}
+                      onClick={() => onTradeChange(trade.id, { included: !trade.included })}
+                      type="button"
+                    >
+                      {trade.included ? 'Included' : 'Excluded'}
+                    </button>
+                    <button
+                      className="mini-toggle"
+                      onClick={() =>
+                        onTradeChange(trade.id, {
+                          status:
+                            trade.status === 'draft'
+                              ? 'review'
+                              : trade.status === 'review'
+                                ? 'approved'
+                                : 'draft',
+                        })
+                      }
+                      type="button"
+                    >
+                      {trade.status}
+                    </button>
+                    <button
+                      className="mini-toggle"
+                      onClick={() =>
+                        onTradeChange(trade.id, {
+                          owner: trade.owner === 'Trader' ? 'Portfolio manager' : 'Trader',
+                        })
+                      }
+                      type="button"
+                    >
+                      {trade.owner}
+                    </button>
+                  </div>
+                  <input
+                    className="proposal-input"
+                    onChange={(event) => onTradeChange(trade.id, { comment: event.target.value })}
+                    placeholder="Add trade note"
+                    type="text"
+                    value={trade.comment}
+                  />
                 </div>
-                <div className="proposal-item__meta">
-                  {trade.name} | {trade.notional}
-                </div>
-                <p>{trade.note}</p>
-                <div className="proposal-trade-controls">
-                  <button
-                    className={clsx('mini-toggle', trade.included && 'is-active')}
-                    onClick={() => onTradeChange(trade.id, { included: !trade.included })}
-                    type="button"
-                  >
-                    {trade.included ? 'Included' : 'Excluded'}
-                  </button>
-                  <button
-                    className="mini-toggle"
-                    onClick={() =>
-                      onTradeChange(trade.id, {
-                        status:
-                          trade.status === 'draft'
-                            ? 'review'
-                            : trade.status === 'review'
-                              ? 'approved'
-                              : 'draft',
-                      })
-                    }
-                    type="button"
-                  >
-                    {trade.status}
-                  </button>
-                  <button
-                    className="mini-toggle"
-                    onClick={() =>
-                      onTradeChange(trade.id, {
-                        owner: trade.owner === 'Trader' ? 'Portfolio manager' : 'Trader',
-                      })
-                    }
-                    type="button"
-                  >
-                    {trade.owner}
-                  </button>
-                </div>
-                <input
-                  className="proposal-input"
-                  onChange={(event) => onTradeChange(trade.id, { comment: event.target.value })}
-                  placeholder="Add trade note"
-                  type="text"
-                  value={trade.comment}
-                />
+              ))
+            ) : (
+              <div className="empty-state">
+                <p>No trades in this proposal are mapped to {activeAccount.name}.</p>
               </div>
-            ))}
+            )}
           </div>
         </div>
       </div>
@@ -1124,33 +1430,176 @@ function ProposalPanel({
               ))}
             </div>
           ) : null}
+          <div className="workflow-timeline">
+            <div className={clsx('workflow-timeline__step', proposalStage !== 'draft' && 'is-complete')}>
+              Draft ready
+            </div>
+            <div className={clsx('workflow-timeline__step', proposalStage === 'exported' || proposalStage === 'queued' ? 'is-complete' : '')}>
+              Memo exported
+            </div>
+            <div className={clsx('workflow-timeline__step', proposalStage === 'queued' && 'is-complete')}>
+              Advisor queued
+            </div>
+          </div>
         </div>
       </div>
 
       <div className="holding-actions">
-        <button className="secondary-button" onClick={onExportProposal} type="button">
-          {proposal.exportLabel}
+        <button
+          className="secondary-button"
+          disabled={!readiness.canExport || exportBusy}
+          onClick={onExportProposal}
+          title={readiness.exportReason}
+          type="button"
+        >
+          {exportBusy ? 'Exporting...' : proposal.exportLabel}
         </button>
-        <button className="primary-button" onClick={onQueueProposal} type="button">
-          {proposal.approveLabel}
+        <button
+          className="primary-button"
+          disabled={!readiness.canQueue || queueBusy}
+          onClick={onQueueProposal}
+          title={readiness.queueReason}
+          type="button"
+        >
+          {queueBusy ? 'Queueing...' : proposal.approveLabel}
+        </button>
+      </div>
+      <div className="proposal-gate-note">
+        Export: {readiness.exportReason} Queue: {readiness.queueReason}
+      </div>
+    </section>
+  )
+}
+
+function IntakeReviewPanel({
+  documentKind,
+  fileName,
+  mode,
+  onCancel,
+  onConfirm,
+  onDocumentKindChange,
+  onFileNameChange,
+  onTranscriptChange,
+  pending,
+  transcript,
+}: {
+  documentKind: DocumentArtifact['kind']
+  fileName: string
+  mode: IntakeMode
+  onCancel: () => void
+  onConfirm: () => void
+  onDocumentKindChange: (kind: DocumentArtifact['kind']) => void
+  onFileNameChange: (fileName: string) => void
+  onTranscriptChange: (transcript: string) => void
+  pending: boolean
+  transcript: string
+}) {
+  if (!mode) {
+    return null
+  }
+
+  return (
+    <section className="intake-panel" aria-live="polite">
+      <div className="intake-panel__header">
+        <div>
+          <div className="section-kicker">{mode === 'upload' ? 'Document intake' : 'Voice intake'}</div>
+          <h3>{mode === 'upload' ? 'Source review' : 'Transcript review'}</h3>
+        </div>
+        <div className={clsx('workflow-pill', pending && 'is-pending')}>
+          {pending ? 'Parsing' : 'Ready'}
+        </div>
+      </div>
+
+      {mode === 'upload' ? (
+        <div className="intake-panel__grid">
+          <label className="field-control">
+            <span>Source type</span>
+            <select
+              onChange={(event) => onDocumentKindChange(event.target.value as DocumentArtifact['kind'])}
+              value={documentKind}
+            >
+              <option value="statement">Statement</option>
+              <option value="memo">Memo</option>
+            </select>
+          </label>
+          <label className="field-control">
+            <span>File</span>
+            <input
+              onChange={(event) => onFileNameChange(event.target.files?.[0]?.name ?? '')}
+              type="file"
+            />
+          </label>
+          <div className="document-highlight">
+            {fileName || 'No file selected. Aura will use a demo custody source.'}
+          </div>
+        </div>
+      ) : (
+        <label className="field-control">
+          <span>Transcript</span>
+          <textarea
+            onChange={(event) => onTranscriptChange(event.target.value)}
+            rows={4}
+            value={transcript}
+          />
+        </label>
+      )}
+
+      <div className="holding-actions">
+        <button className="secondary-button" disabled={pending} onClick={onCancel} type="button">
+          Cancel
+        </button>
+        <button className="primary-button" disabled={pending} onClick={onConfirm} type="button">
+          {pending ? 'Processing...' : mode === 'upload' ? 'Attach source' : 'Attach transcript'}
         </button>
       </div>
     </section>
   )
 }
 
+function UndoBanner({ toast }: { toast: UndoToast | null }) {
+  if (!toast) {
+    return null
+  }
+
+  return (
+    <div className="undo-banner">
+      <span>{toast.label}</span>
+      <button className="mini-toggle" onClick={toast.onUndo} type="button">
+        <RotateCcw size={14} />
+        {toast.actionLabel}
+      </button>
+    </div>
+  )
+}
+
 export default function AuraDemoApp() {
   const [workspace, setWorkspace] = useState<AuraWorkspaceState>(() => getInitialWorkspaceState())
   const [composerValue, setComposerValue] = useState('')
+  const [documentKind, setDocumentKind] = useState<DocumentArtifact['kind']>('statement')
   const [insightMode, setInsightMode] = useState<InsightMode>(null)
+  const [intakeMode, setIntakeMode] = useState<IntakeMode>(null)
   const [notificationFilter, setNotificationFilter] = useState<NotificationFilter>('all')
   const [notificationsOpen, setNotificationsOpen] = useState(false)
+  const [pendingActions, setPendingActions] = useState<AsyncAction[]>([])
   const [proposalOpen, setProposalOpen] = useState(() => getInitialProposalOpen())
   const [portfolioRailOpen, setPortfolioRailOpen] = useState(false)
   const [marketRailOpen, setMarketRailOpen] = useState(false)
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null)
+  const [selectedFileName, setSelectedFileName] = useState('')
+  const [undoToast, setUndoToast] = useState<UndoToast | null>(null)
+  const [voiceTranscript, setVoiceTranscript] = useState(
+    'Reduce risk without going fully defensive. Preserve liquidity for near-term distributions and keep the solution inside the household US-only mandate.',
+  )
+  const [workspaceError, setWorkspaceError] = useState('')
 
   const conversationBottomRef = useRef<HTMLDivElement | null>(null)
+  const marketButtonRef = useRef<HTMLButtonElement | null>(null)
+  const marketRailRef = useRef<HTMLElement | null>(null)
+  const notificationButtonRef = useRef<HTMLButtonElement | null>(null)
+  const notificationPopoverRef = useRef<HTMLDivElement | null>(null)
+  const pendingActionsRef = useRef<AsyncAction[]>([])
+  const portfolioButtonRef = useRef<HTMLButtonElement | null>(null)
+  const portfolioRailRef = useRef<HTMLElement | null>(null)
   const workspaceRef = useRef(workspace)
 
   const activeThreadId = workspace.activeThreadId
@@ -1208,26 +1657,23 @@ export default function AuraDemoApp() {
       return true
     })
   }, [notificationFilter, notifications])
-  const pinnedLabels = useMemo(
+  const analysisReferences = useMemo(
     () =>
-      threadWorkspace.pinnedAnalysisIds
-        .map((analysisId) =>
-          activeMessages.find((message) => message.id === analysisId && message.scenarioId)?.scenarioId,
-        )
-        .filter((scenarioId): scenarioId is ScenarioId => Boolean(scenarioId))
-        .map((scenarioId) => scenarioById[scenarioId].label),
-    [activeMessages, threadWorkspace.pinnedAnalysisIds],
+      activeMessages
+        .map(buildAnalysisReference)
+        .filter((analysis): analysis is AnalysisReference => Boolean(analysis)),
+    [activeMessages],
   )
-  const compareLabels = useMemo(
-    () =>
-      threadWorkspace.compareAnalysisIds
-        .map((analysisId) =>
-          activeMessages.find((message) => message.id === analysisId && message.scenarioId)?.scenarioId,
-        )
-        .filter((scenarioId): scenarioId is ScenarioId => Boolean(scenarioId))
-        .map((scenarioId) => scenarioById[scenarioId].label),
-    [activeMessages, threadWorkspace.compareAnalysisIds],
+  const pinnedAnalyses = useMemo(
+    () => analysisReferences.filter((analysis) => threadWorkspace.pinnedAnalysisIds.includes(analysis.id)),
+    [analysisReferences, threadWorkspace.pinnedAnalysisIds],
   )
+  const comparedAnalyses = useMemo(
+    () => analysisReferences.filter((analysis) => threadWorkspace.compareAnalysisIds.includes(analysis.id)),
+    [analysisReferences, threadWorkspace.compareAnalysisIds],
+  )
+  const exportBusy = pendingActions.includes('export')
+  const queueBusy = pendingActions.includes('queue')
 
   useEffect(() => {
     conversationBottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
@@ -1237,16 +1683,70 @@ export default function AuraDemoApp() {
     workspaceRef.current = workspace
   }, [workspace])
 
+  useEffect(() => {
+    function handleKeyDown(event: globalThis.KeyboardEvent) {
+      if (notificationsOpen) {
+        trapFocusInContainer(event, notificationPopoverRef.current)
+      } else if (portfolioRailOpen) {
+        trapFocusInContainer(event, portfolioRailRef.current)
+      } else if (marketRailOpen) {
+        trapFocusInContainer(event, marketRailRef.current)
+      }
+
+      if (event.key !== 'Escape') {
+        return
+      }
+
+      if (notificationsOpen) {
+        setNotificationsOpen(false)
+        notificationButtonRef.current?.focus()
+      } else if (portfolioRailOpen) {
+        setPortfolioRailOpen(false)
+        portfolioButtonRef.current?.focus()
+      } else if (marketRailOpen) {
+        setMarketRailOpen(false)
+        marketButtonRef.current?.focus()
+      }
+    }
+
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [marketRailOpen, notificationsOpen, portfolioRailOpen])
+
   async function runWorkspaceMutation(
     mutate: (current: AuraWorkspaceState) => Promise<AuraWorkspaceState>,
   ) {
-    const nextWorkspace = await mutate(workspaceRef.current)
+    try {
+      setWorkspaceError('')
+      const nextWorkspace = await mutate(workspaceRef.current)
 
-    startTransition(() => {
-      setWorkspace(nextWorkspace)
-    })
+      startTransition(() => {
+        setWorkspace(nextWorkspace)
+      })
 
-    return nextWorkspace
+      return nextWorkspace
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'The local workspace could not be updated.'
+      setWorkspaceError(message)
+      throw error
+    }
+  }
+
+  async function runAsyncAction<T>(action: AsyncAction, task: () => Promise<T>) {
+    if (pendingActionsRef.current.includes(action)) {
+      return null
+    }
+
+    pendingActionsRef.current = [...pendingActionsRef.current, action]
+    setPendingActions(pendingActionsRef.current)
+    try {
+      return await task()
+    } catch {
+      return null
+    } finally {
+      pendingActionsRef.current = pendingActionsRef.current.filter((entry) => entry !== action)
+      setPendingActions(pendingActionsRef.current)
+    }
   }
 
   function appendScenarioExchange(threadId: string, nextScenarioId: ScenarioId, promptText: string) {
@@ -1254,8 +1754,8 @@ export default function AuraDemoApp() {
     setInsightMode(null)
     setProposalOpen(false)
     setNotificationsOpen(false)
-    void runWorkspaceMutation((current) =>
-      submitPromptToWorkspace(current, threadId, promptText, nextScenarioId),
+    void runAsyncAction('prompt', () =>
+      runWorkspaceMutation((current) => submitPromptToWorkspace(current, threadId, promptText, nextScenarioId)),
     )
   }
 
@@ -1268,7 +1768,7 @@ export default function AuraDemoApp() {
     setNotificationsOpen(false)
     setPortfolioRailOpen(false)
     setMarketRailOpen(false)
-    void runWorkspaceMutation((current) => selectActiveThread(current, thread.id))
+    void runAsyncAction('thread', () => runWorkspaceMutation((current) => selectActiveThread(current, thread.id)))
   }
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -1295,38 +1795,70 @@ export default function AuraDemoApp() {
     setInsightMode(null)
     setProposalOpen(false)
     setNotificationsOpen(false)
-    void runWorkspaceMutation((current) => resetThreadWorkspace(current, activeThread.id))
+    void runAsyncAction('reset', () => runWorkspaceMutation((current) => resetThreadWorkspace(current, activeThread.id)))
   }
 
   function handlePrimaryAction(scenarioId: ScenarioId) {
     setInsightMode('action')
     setProposalOpen(true)
-    void (async () => {
+    void runAsyncAction('queue', async () => {
       await runWorkspaceMutation((current) => focusThreadScenario(current, activeThreadId, scenarioId))
-      await runWorkspaceMutation((current) => ensureProposalReady(current, activeThreadId))
-    })()
+      return runWorkspaceMutation((current) => ensureProposalReady(current, activeThreadId))
+    })
   }
 
   function handleSecondaryAction(scenarioId: ScenarioId) {
     setInsightMode('detail')
     setProposalOpen(false)
-    void runWorkspaceMutation((current) => focusThreadScenario(current, activeThreadId, scenarioId))
+    void runAsyncAction('prompt', () =>
+      runWorkspaceMutation((current) => focusThreadScenario(current, activeThreadId, scenarioId)),
+    )
   }
 
   function handleExportProposal(scenarioId: ScenarioId) {
+    if (!window.confirm('Export this selected-account proposal memo?')) {
+      return
+    }
+
     setProposalOpen(true)
-    void (async () => {
+    void runAsyncAction('export', async () => {
       await runWorkspaceMutation((current) => focusThreadScenario(current, activeThreadId, scenarioId))
-      await runWorkspaceMutation((current) => exportProposalMemo(current, activeThreadId, scenarioId))
-    })()
+      const nextWorkspace = await runWorkspaceMutation((current) => exportProposalMemo(current, activeThreadId, scenarioId))
+      setUndoToast({
+        actionLabel: 'Undo status',
+        label: 'Memo exported.',
+        onUndo: () => {
+          void runAsyncAction('export', () =>
+            runWorkspaceMutation((current) => setProposalWorkflowStage(current, activeThreadId, 'ready')),
+          )
+          setUndoToast(null)
+        },
+      })
+      return nextWorkspace
+    })
   }
 
   function handleQueueProposal(scenarioId: ScenarioId) {
+    if (!window.confirm('Queue this selected-account proposal for advisor review?')) {
+      return
+    }
+
     setProposalOpen(true)
-    void (async () => {
+    void runAsyncAction('queue', async () => {
       await runWorkspaceMutation((current) => focusThreadScenario(current, activeThreadId, scenarioId))
-      await runWorkspaceMutation((current) => queueProposalReview(current, activeThreadId, scenarioId))
-    })()
+      const nextWorkspace = await runWorkspaceMutation((current) => queueProposalReview(current, activeThreadId, scenarioId))
+      setUndoToast({
+        actionLabel: 'Undo queue',
+        label: 'Advisor review queued.',
+        onUndo: () => {
+          void runAsyncAction('queue', () =>
+            runWorkspaceMutation((current) => setProposalWorkflowStage(current, activeThreadId, 'ready')),
+          )
+          setUndoToast(null)
+        },
+      })
+      return nextWorkspace
+    })
   }
 
   function handleToggleAdvisorQueue() {
@@ -1334,20 +1866,27 @@ export default function AuraDemoApp() {
       setProposalOpen(true)
     }
 
-    void runWorkspaceMutation((current) =>
-      toggleAdvisorQueue(current, activeThreadId, activeScenarioId),
+    void runAsyncAction('advisor', () =>
+      runWorkspaceMutation((current) => toggleAdvisorQueue(current, activeThreadId, activeScenarioId)),
     )
   }
 
   function handleAttachment() {
-    void (async () => {
+    setIntakeMode('upload')
+    setDocumentKind('statement')
+    setSelectedFileName('')
+  }
+
+  function handleConfirmAttachment() {
+    void runAsyncAction('attachment', async () => {
+      const title = selectedFileName || `${activeAccount.name} custody statement`
       const nextWorkspace = await runWorkspaceMutation((current) =>
         addDocumentToWorkspace(
           current,
           activeThreadId,
           {
-            kind: 'statement',
-            title: `${activeAccount.name} custody statement`,
+            kind: documentKind,
+            title,
             source: 'Schwab secure upload',
             status: 'parsed',
             uploadedAt: 'Just now',
@@ -1364,15 +1903,35 @@ export default function AuraDemoApp() {
         ),
       )
 
+      const documentId = nextWorkspace.threadStateById[activeThreadId].documents[0]?.id ?? null
       startTransition(() => {
-        setActiveDocumentId(nextWorkspace.threadStateById[activeThreadId].documents[0]?.id ?? null)
+        setActiveDocumentId(documentId)
+        setIntakeMode(null)
       })
-    })()
+      if (documentId) {
+        setUndoToast({
+          actionLabel: 'Undo intake',
+          label: `${title} attached.`,
+          onUndo: () => {
+            void runAsyncAction('attachment', () =>
+              runWorkspaceMutation((current) => removeDocumentFromWorkspace(current, activeThreadId, documentId)),
+            )
+            setUndoToast(null)
+          },
+        })
+      }
+
+      return nextWorkspace
+    })
   }
 
   function handleVoicePrompt() {
     setComposerValue(scenarioById.risk.userPrompt)
-    void (async () => {
+    setIntakeMode('voice')
+  }
+
+  function handleConfirmVoiceTranscript() {
+    void runAsyncAction('voice', async () => {
       const nextWorkspace = await runWorkspaceMutation((current) =>
         addDocumentToWorkspace(
           current,
@@ -1386,38 +1945,65 @@ export default function AuraDemoApp() {
             accountIds: [activeAccount.id],
             scenarioIds: ['risk'],
             highlights: [
-              'Reduce risk without going fully defensive.',
-              'Preserve liquidity for near-term distributions.',
-              'Keep the solution inside the household US-only mandate.',
+              ...voiceTranscript
+                .split('.')
+                .map((sentence) => sentence.trim())
+                .filter(Boolean)
+                .slice(0, 3)
+                .map((sentence) => `${sentence}.`),
             ],
-            excerpt:
-              'Aura transcribed a voice note requesting a softer risk profile while maintaining upside participation.',
+            excerpt: voiceTranscript,
           },
           'Aura transcribed the latest voice note and staged a risk-focused follow-up in the composer.',
         ),
       )
 
+      const documentId = nextWorkspace.threadStateById[activeThreadId].documents[0]?.id ?? null
       startTransition(() => {
-        setActiveDocumentId(nextWorkspace.threadStateById[activeThreadId].documents[0]?.id ?? null)
+        setActiveDocumentId(documentId)
+        setIntakeMode(null)
       })
-    })()
+      if (documentId) {
+        setUndoToast({
+          actionLabel: 'Undo transcript',
+          label: 'Voice transcript attached.',
+          onUndo: () => {
+            void runAsyncAction('voice', () =>
+              runWorkspaceMutation((current) => removeDocumentFromWorkspace(current, activeThreadId, documentId)),
+            )
+            setUndoToast(null)
+          },
+        })
+      }
+
+      return nextWorkspace
+    })
   }
 
   function handleGenerateSummary() {
-    void runWorkspaceMutation((current) => generateThreadSummary(current, activeThreadId))
+    void runAsyncAction('summary', () => runWorkspaceMutation((current) => generateThreadSummary(current, activeThreadId)))
   }
 
   function handleTogglePin(analysisId: string) {
-    void runWorkspaceMutation((current) => togglePinnedAnalysis(current, activeThreadId, analysisId))
+    void runAsyncAction('summary', () =>
+      runWorkspaceMutation((current) => togglePinnedAnalysis(current, activeThreadId, analysisId)),
+    )
   }
 
   function handleToggleCompare(analysisId: string) {
-    void runWorkspaceMutation((current) => toggleComparedAnalysis(current, activeThreadId, analysisId))
+    if (!threadWorkspace.compareAnalysisIds.includes(analysisId) && threadWorkspace.compareAnalysisIds.length >= 2) {
+      setWorkspaceError('Compare mode is limited to two analyses. Remove one before adding another.')
+      return
+    }
+
+    void runAsyncAction('summary', () =>
+      runWorkspaceMutation((current) => toggleComparedAnalysis(current, activeThreadId, analysisId)),
+    )
   }
 
   function handleToggleChecklist(checklistId: string, scenarioId: ScenarioId) {
-    void runWorkspaceMutation((current) =>
-      toggleProposalChecklistItem(current, activeThreadId, scenarioId, checklistId),
+    void runAsyncAction('queue', () =>
+      runWorkspaceMutation((current) => toggleProposalChecklistItem(current, activeThreadId, scenarioId, checklistId)),
     )
   }
 
@@ -1426,19 +2012,21 @@ export default function AuraDemoApp() {
     patch: Partial<Pick<ProposalTradeState, 'included' | 'owner' | 'comment' | 'status'>>,
     scenarioId: ScenarioId,
   ) {
-    void runWorkspaceMutation((current) =>
-      updateProposalTrade(current, activeThreadId, scenarioId, tradeId, patch),
+    void runAsyncAction('queue', () =>
+      runWorkspaceMutation((current) => updateProposalTrade(current, activeThreadId, scenarioId, tradeId, patch)),
     )
   }
 
   function handleAddProposalReviewComment(comment: string, scenarioId: ScenarioId) {
-    void runWorkspaceMutation((current) => addProposalComment(current, activeThreadId, scenarioId, comment))
+    void runAsyncAction('queue', () =>
+      runWorkspaceMutation((current) => addProposalComment(current, activeThreadId, scenarioId, comment)),
+    )
   }
 
   function handleOpenDocument(documentId: string) {
     const document = activeDocuments.find((item) => item.id === documentId)
 
-    void (async () => {
+    void runAsyncAction('notification', async () => {
       if (document?.scenarioIds[0]) {
         await runWorkspaceMutation((current) =>
           focusThreadScenario(current, activeThreadId, document.scenarioIds[0]),
@@ -1449,13 +2037,14 @@ export default function AuraDemoApp() {
       startTransition(() => {
         setActiveDocumentId(documentId)
       })
-    })()
+      return null
+    })
   }
 
   function handleNotificationOpen(notification: NotificationItem) {
     const targetThreadId = notification.threadId ?? activeThreadId
 
-    void (async () => {
+    void runAsyncAction('notification', async () => {
       await runWorkspaceMutation((current) => markNotificationRead(current, notification.id))
 
       if (notification.threadId) {
@@ -1477,11 +2066,31 @@ export default function AuraDemoApp() {
       setNotificationsOpen(false)
       setPortfolioRailOpen(false)
       setMarketRailOpen(false)
-    })()
+      return null
+    })
   }
 
   function handleArchiveNotification(notificationId: string) {
-    void runWorkspaceMutation((current) => archiveNotification(current, notificationId))
+    void runAsyncAction('notification', () =>
+      runWorkspaceMutation((current) => archiveNotification(current, notificationId)),
+    )
+  }
+
+  function handleJumpToAnalysis(analysisId: string) {
+    setInsightMode(null)
+    setProposalOpen(false)
+    void runAsyncAction('summary', async () => {
+      const nextWorkspace = await runWorkspaceMutation((current) =>
+        focusThreadAnalysis(current, activeThreadId, analysisId),
+      )
+      window.requestAnimationFrame(() => {
+        document.querySelector(`[data-analysis-id="${analysisId}"]`)?.scrollIntoView({
+          behavior: 'smooth',
+          block: 'start',
+        })
+      })
+      return nextWorkspace
+    })
   }
 
   return (
@@ -1490,15 +2099,35 @@ export default function AuraDemoApp() {
         aria-hidden="true"
         className={clsx('mobile-overlay', (portfolioRailOpen || marketRailOpen) && 'is-visible')}
         onClick={() => {
+          const shouldFocusMarket = marketRailOpen
           setPortfolioRailOpen(false)
           setMarketRailOpen(false)
+          if (shouldFocusMarket) {
+            marketButtonRef.current?.focus()
+          } else {
+            portfolioButtonRef.current?.focus()
+          }
         }}
       />
 
-      <aside className={clsx('aura-rail aura-rail--left', portfolioRailOpen && 'is-open')}>
+      <aside
+        aria-label="Portfolio workspace"
+        aria-modal={portfolioRailOpen ? 'true' : undefined}
+        className={clsx('aura-rail aura-rail--left', portfolioRailOpen && 'is-open')}
+        id="portfolio-rail"
+        ref={portfolioRailRef}
+        role={portfolioRailOpen ? 'dialog' : 'complementary'}
+      >
         <div className="mobile-rail-topbar">
           <span>Portfolio</span>
-          <button onClick={() => setPortfolioRailOpen(false)} type="button">
+          <button
+            aria-label="Close portfolio rail"
+            onClick={() => {
+              setPortfolioRailOpen(false)
+              portfolioButtonRef.current?.focus()
+            }}
+            type="button"
+          >
             <X size={18} />
           </button>
         </div>
@@ -1519,8 +2148,11 @@ export default function AuraDemoApp() {
         <header className="top-shell">
           <div className="mobile-rail-actions">
             <button
+              aria-controls="portfolio-rail"
+              aria-expanded={portfolioRailOpen}
               className="mobile-rail-button"
               onClick={() => setPortfolioRailOpen(true)}
+              ref={portfolioButtonRef}
               type="button"
             >
               <LayoutGrid size={16} />
@@ -1546,6 +2178,7 @@ export default function AuraDemoApp() {
           <div className="top-shell__actions">
             <button
               className={clsx('advisor-button', advisorQueued && 'is-active')}
+              disabled={pendingActions.includes('advisor')}
               onClick={handleToggleAdvisorQueue}
               type="button"
             >
@@ -1556,8 +2189,11 @@ export default function AuraDemoApp() {
             <div className="notification-shell">
               <button
                 aria-label="Notifications"
+                aria-controls="notification-popover"
+                aria-expanded={notificationsOpen}
                 className={clsx('icon-button', notificationsOpen && 'is-active')}
                 onClick={() => setNotificationsOpen((current) => !current)}
+                ref={notificationButtonRef}
                 type="button"
               >
                 <Bell size={18} />
@@ -1565,13 +2201,27 @@ export default function AuraDemoApp() {
               </button>
 
               {notificationsOpen ? (
-                <div className="notification-popover">
+                <div
+                  aria-label="Workflow activity"
+                  aria-modal="false"
+                  className="notification-popover"
+                  id="notification-popover"
+                  ref={notificationPopoverRef}
+                  role="dialog"
+                >
                   <div className="notification-popover__header">
                     <div>
                       <div className="section-kicker">Workflow activity</div>
                       <div className="goal-row__meta">{unreadNotifications.length} unread</div>
                     </div>
-                    <button onClick={() => setNotificationsOpen(false)} type="button">
+                    <button
+                      aria-label="Close notifications"
+                      onClick={() => {
+                        setNotificationsOpen(false)
+                        notificationButtonRef.current?.focus()
+                      }}
+                      type="button"
+                    >
                       <X size={16} />
                     </button>
                   </div>
@@ -1629,8 +2279,11 @@ export default function AuraDemoApp() {
             </div>
 
             <button
+              aria-controls="market-rail"
+              aria-expanded={marketRailOpen}
               className="mobile-rail-button mobile-rail-button--markets"
               onClick={() => setMarketRailOpen(true)}
+              ref={marketButtonRef}
               type="button"
             >
               <Activity size={16} />
@@ -1645,6 +2298,15 @@ export default function AuraDemoApp() {
             Aura queued a human review with the active scenario, proposed trade basket, and source-backed assumptions.
           </div>
         ) : null}
+        {workspaceError ? (
+          <div className="error-banner" role="status">
+            <span>{workspaceError}</span>
+            <button className="mini-toggle" onClick={() => setWorkspaceError('')} type="button">
+              Dismiss
+            </button>
+          </div>
+        ) : null}
+        <UndoBanner toast={undoToast} />
 
         <section className="chat-scroll">
           <div className="welcome-block">
@@ -1673,10 +2335,18 @@ export default function AuraDemoApp() {
 
           <div className="workspace-stack">
             <WorkspaceSummary
-              compareLabels={compareLabels}
+              comparedAnalyses={comparedAnalyses}
+              onJumpToAnalysis={handleJumpToAnalysis}
               onGenerateSummary={handleGenerateSummary}
-              pinnedLabels={pinnedLabels}
+              onToggleCompare={handleToggleCompare}
+              onTogglePin={handleTogglePin}
+              pinnedAnalyses={pinnedAnalyses}
               summary={threadWorkspace.summaryCard}
+            />
+            <AnalysisTimeline
+              activeAnalysisId={activeAnalysisId}
+              analyses={analysisReferences}
+              onJumpToAnalysis={handleJumpToAnalysis}
             />
             <AccountLens account={activeAccount} key={activeAccount.id} />
             <DocumentHub
@@ -1704,17 +2374,32 @@ export default function AuraDemoApp() {
               }
 
               return (
-                <div className="message-row" key={message.id}>
+                <div
+                  className="message-row"
+                  data-analysis-id={message.variant === 'analysis' ? message.id : undefined}
+                  key={message.id}
+                >
                   <AssistantAvatar />
                   <div className="message-content">
                     <div className="message-meta">{message.createdAt}</div>
-                    {message.variant === 'analysis' && scenario ? (
+                    {message.variant === 'analysis' && scenario && message.id !== activeAnalysisId ? (
+                      <AnalysisPreview
+                        compared={threadWorkspace.compareAnalysisIds.includes(message.id)}
+                        message={message}
+                        onExpand={() => handleJumpToAnalysis(message.id)}
+                        onToggleCompare={() => handleToggleCompare(message.id)}
+                        onTogglePin={() => handleTogglePin(message.id)}
+                        pinned={threadWorkspace.pinnedAnalysisIds.includes(message.id)}
+                        scenario={scenario}
+                      />
+                    ) : message.variant === 'analysis' && scenario ? (
                       <ScenarioResponse
                         active={message.id === activeAnalysisId}
                         activeAccount={activeAccount}
                         activeMarket={activeMarket}
                         compared={threadWorkspace.compareAnalysisIds.includes(message.id)}
                         enhancement={scenarioEnhancementById[scenario.id]}
+                        exportBusy={exportBusy}
                         insightMode={insightMode}
                         onAddProposalComment={(comment) => handleAddProposalReviewComment(comment, scenario.id)}
                         onExportProposal={() => handleExportProposal(scenario.id)}
@@ -1732,6 +2417,7 @@ export default function AuraDemoApp() {
                         }
                         proposalOpen={proposalOpen}
                         proposalStage={proposalStage}
+                        queueBusy={queueBusy}
                         scenario={scenario}
                       />
                     ) : (
@@ -1747,7 +2433,13 @@ export default function AuraDemoApp() {
 
         <form className="composer-shell" onSubmit={handleSubmit}>
           <div className="composer">
-            <button className="composer-icon" onClick={handleAttachment} type="button" aria-label="Attach portfolio file">
+            <button
+              aria-label="Attach portfolio file"
+              className="composer-icon"
+              disabled={pendingActions.includes('attachment')}
+              onClick={handleAttachment}
+              type="button"
+            >
               <Paperclip size={18} />
             </button>
 
@@ -1760,14 +2452,37 @@ export default function AuraDemoApp() {
             />
 
             <div className="composer__actions">
-              <button className="composer-icon" onClick={handleVoicePrompt} type="button" aria-label="Use voice input">
+              <button
+                aria-label="Use voice input"
+                className="composer-icon"
+                disabled={pendingActions.includes('voice')}
+                onClick={handleVoicePrompt}
+                type="button"
+              >
                 <Mic size={18} />
               </button>
-              <button className="composer-send" type="submit" aria-label="Send message">
+              <button
+                aria-label="Send message"
+                className="composer-send"
+                disabled={pendingActions.includes('prompt')}
+                type="submit"
+              >
                 <SendHorizontal size={18} />
               </button>
             </div>
           </div>
+          <IntakeReviewPanel
+            documentKind={documentKind}
+            fileName={selectedFileName}
+            mode={intakeMode}
+            onCancel={() => setIntakeMode(null)}
+            onConfirm={intakeMode === 'voice' ? handleConfirmVoiceTranscript : handleConfirmAttachment}
+            onDocumentKindChange={setDocumentKind}
+            onFileNameChange={setSelectedFileName}
+            onTranscriptChange={setVoiceTranscript}
+            pending={pendingActions.includes(intakeMode === 'voice' ? 'voice' : 'attachment')}
+            transcript={voiceTranscript}
+          />
 
           <div className="composer-note">
             Source-backed demo for US markets only. Review tax and suitability assumptions before trading.
@@ -1775,10 +2490,24 @@ export default function AuraDemoApp() {
         </form>
       </main>
 
-      <aside className={clsx('aura-rail aura-rail--right', marketRailOpen && 'is-open')}>
+      <aside
+        aria-label="Market workspace"
+        aria-modal={marketRailOpen ? 'true' : undefined}
+        className={clsx('aura-rail aura-rail--right', marketRailOpen && 'is-open')}
+        id="market-rail"
+        ref={marketRailRef}
+        role={marketRailOpen ? 'dialog' : 'complementary'}
+      >
         <div className="mobile-rail-topbar">
           <span>Markets</span>
-          <button onClick={() => setMarketRailOpen(false)} type="button">
+          <button
+            aria-label="Close market rail"
+            onClick={() => {
+              setMarketRailOpen(false)
+              marketButtonRef.current?.focus()
+            }}
+            type="button"
+          >
             <X size={18} />
           </button>
         </div>

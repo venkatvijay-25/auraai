@@ -253,6 +253,21 @@ export async function queueProposalReview(
   })
 }
 
+export async function setProposalWorkflowStage(
+  workspace: AuraWorkspaceState,
+  threadId: string,
+  stage: ProposalStage,
+  advisorQueued = false,
+): Promise<AuraWorkspaceState> {
+  return persistWorkspaceState(
+    withThreadState(workspace, threadId, (threadState) => ({
+      ...threadState,
+      proposalStage: stage,
+      advisorQueued,
+    })),
+  )
+}
+
 export async function toggleAdvisorQueue(
   workspace: AuraWorkspaceState,
   threadId: string,
@@ -523,6 +538,19 @@ export async function addDocumentToWorkspace(
   })
 }
 
+export async function removeDocumentFromWorkspace(
+  workspace: AuraWorkspaceState,
+  threadId: string,
+  documentId: string,
+): Promise<AuraWorkspaceState> {
+  return persistWorkspaceState(
+    withThreadState(workspace, threadId, (threadState) => ({
+      ...threadState,
+      documents: threadState.documents.filter((document) => document.id !== documentId),
+    })),
+  )
+}
+
 export async function focusThreadScenario(
   workspace: AuraWorkspaceState,
   threadId: string,
@@ -541,6 +569,36 @@ export async function focusThreadScenario(
       ...threadState,
       activeScenarioId: scenarioId ?? threadState.activeScenarioId,
       activeAnalysisId: matchingAnalysis?.id ?? threadState.activeAnalysisId,
+    })),
+    activeThreadId: threadId,
+    activeMarketId: thread.focusMarketId,
+  })
+}
+
+export async function focusThreadAnalysis(
+  workspace: AuraWorkspaceState,
+  threadId: string,
+  analysisId: string,
+): Promise<AuraWorkspaceState> {
+  const thread = threadById[threadId]
+  const currentThreadState = workspace.threadStateById[threadId] ?? buildThreadWorkspaceState(thread)
+  const analysis = currentThreadState.conversation.find(
+    (message) => message.id === analysisId && message.variant === 'analysis' && message.scenarioId,
+  )
+
+  if (!analysis?.scenarioId) {
+    return persistWorkspaceState({
+      ...workspace,
+      activeThreadId: threadId,
+      activeMarketId: thread.focusMarketId,
+    })
+  }
+
+  return persistWorkspaceState({
+    ...withThreadState(workspace, threadId, (threadState) => ({
+      ...threadState,
+      activeAnalysisId: analysisId,
+      activeScenarioId: analysis.scenarioId!,
     })),
     activeThreadId: threadId,
     activeMarketId: thread.focusMarketId,
